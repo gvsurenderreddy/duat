@@ -1,0 +1,1484 @@
+#! /usr/bin/perl
+#
+# $Id: duat,v 0.93 2010/07/16 10:30:00 lace Exp $
+
+# Copyright (C) 2010 Stephan Q <wesetnebu@gmail.com>
+# based on tcpoverudp by Jan Kratochvil <project-tcpoverudp@jankratochvil.net>
+# 
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; exactly version 2 of June 1991 is required
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+
+
+
+use strict;
+use warnings;
+use Getopt::Long;
+require IO::Socket::INET;
+use Fcntl;
+use Carp qw(cluck confess);
+use Socket;
+use Time::HiRes qw(time);
+eval {require Net::Pcap; 1;};
+eval {require String::CRC32; 1;};
+eval {require Compress::Zlib; 1;};
+eval {require Crypt::CBC; 1;};
+eval {require Pod::Usage; 1;};
+
+
+#my $READ_SIZE=256;	# 96kbit = 47 x 256B
+#my $MAX_UNACKED=8;
+my $READ_SIZE=1492;	# 96kbit = 47 x 256B
+my $MAX_UDP=512;	# +header
+my $MAX_QUEUE_UDP=58;	# +header
+my $MAX_UNACKED=8;
+my $MAX_LOG=1200;
+my $MAX_CONG_TCP=30;
+
+
+my $V=1;
+$|=1;
+for (qw(PIPE)) {
+	$SIG{$_}=eval "sub { warn_r 'INFO: Got signal SIG$_'; };";
+}
+
+my $D;
+my $detach;
+my $opt_udp_listen_port;
+my $opt_udp_server;
+my $opt_tty;
+my @tty;
+my $opt_dns_listen_port;
+my $opt_dns_server;
+my $opt_udp_server_addr;
+my $opt_udp_server_port;
+my $opt_tcp_listen_ports;
+my @opt_tcp_listen_port;
+my $opt_tcp_forwards;
+my @opt_tcp_forward_addr;
+my @opt_tcp_forward_port;
+my $opt_timeout=0.1;
+my $opt_recvloss=0;
+my $opt_udp_retry=20;
+my $opt_remote_redir;
+my $opt_transparent_proxy;
+my $opt_iptables_autoconfig;
+my $opt_logfile;
+my $opt_remotelog;
+my $opt_oldpid;
+my $opt_client_timeout=600;
+my $opt_tty_snow;
+my $opt_layer;
+my $opt_multimode;
+my $opt_double_ack;
+my $opt_slowtcp;
+my $blowfish_key;
+
+sub usage () {
+	Pod::Usage::pod2usage(1);
+	exit;
+}
+
+usage if !GetOptions(
+		  "udp-retry=s",\$opt_udp_retry,
+		  "udp-listen-port=s",\$opt_udp_listen_port,
+		  "dns-listen-port=s",\$opt_dns_listen_port,
+		  "dns-server=s",\$opt_dns_server,
+		  "udp-server=s",\$opt_udp_server,
+		  "tcp-listen-ports=s",\$opt_tcp_listen_ports,
+		  "tcp-forwards=s",\$opt_tcp_forwards,
+		"t|timeout=s",\$opt_timeout,
+		  "recvloss=s",\$opt_recvloss,
+		"d|debug+",\$D,
+		"r|remote-redir",\$opt_remote_redir,
+		"a|iptables-autoconfig",\$opt_iptables_autoconfig,
+		  "transparent-proxy",\$opt_transparent_proxy,
+		  "detach",\$detach,
+		"l|logfile=s",\$opt_logfile,
+		"tty=s",\$opt_tty,
+		"remote-log",\$opt_remotelog,
+		"s|size=s",\$MAX_UDP,
+		"client-timeout=s",\$opt_client_timeout,
+		"m|multimode",\$opt_multimode,
+		"slowtcp",\$opt_slowtcp,
+		"double-ack",\$opt_double_ack,
+		"oldpid=s",\$opt_oldpid,
+		"tty-snow=s",\$opt_tty_snow,
+		"layer=s",\$opt_layer,
+		"h|help",\&usage,
+		);
+
+if (defined $opt_layer and $opt_layer=~ m/crypt:/) {
+	print "please type in a long key to use with encryption :";
+	$blowfish_key= <STDIN>;
+}
+
+if (defined $detach) { 
+    close (STDIN);
+    close (STDOUT);
+    close (STDERR);
+    exit if (fork());
+    exit if (fork());
+}
+
+if (defined $opt_logfile) {
+    open STDERR, ">".$opt_logfile;
+}
+
+if (defined $opt_tcp_forwards) {
+    my $opta=$opt_tcp_forwards;
+    my $optp=$opt_tcp_forwards;
+    $opta=~ s/:[0-9]+//g;
+    $optp=~ s/[[:alnum:].]+://g;
+    #warn "-- $opta ------- $optp ---";
+    @opt_tcp_forward_addr=split(/,/,$opta);
+    @opt_tcp_forward_port=split(/,/,$optp);
+}
+
+@tty=split(/,/,$opt_tty) if (defined $opt_tty);
+@opt_tcp_listen_port=split(/,/,$opt_tcp_listen_ports) if (defined $opt_tcp_listen_ports);
+($opt_udp_server_addr,$opt_udp_server_port)=split(/:/,$opt_udp_server) if (defined $opt_udp_server);
+
+my $now=time();
+my %sock;
+my %active;
+my %client;
+my $own_id;
+my $TYPE_OPEN=0;	# new_id,which
+my $TYPE_SEND=1;	# id,seq,data
+my $TYPE_ACK=2;		# id,seq
+my $TYPE_CLOSE=3;	# id,seq
+my $TYPE_LOG=4;		# id,logdata
+my $TYPE_DNS=5;		# dnsdata
+my $TYPE_ACK_CONG=6;		# id,seq
+my $TYPE_FORCE_CLOSE=7;	# id,seq
+#my $peer_addr;
+my $FLAG_FRAG=0b01000000;
+my $FLAG_ORIG=0b10000000;
+my $FLAG_TYPE=0b00111111;
+my %back_dns;
+my $MAGIC=0x31393032;
+my @backlog;
+my $backtime=0;
+my $add_timeout=0;
+my $ack_balance=0;
+my $uuencode=0;
+my $id_max=0;
+my $idns;
+my $idex;
+my $idlog;
+my $client_log;
+my $lastcheck=$now;
+my @sent_queue_udp;
+my %config_tty;
+my $reudp=0;
+sub sendpkt;
+sub sock_new;
+sub id_new;
+
+$uuencode=1 if (defined $opt_layer and ($opt_layer=~ m/uuencode/i)); 
+
+sub warn_r($)
+{
+	my ($send_data)=@_;
+	if (defined $opt_remotelog) {
+		print STDERR $send_data."\n" if (defined $opt_logfile);
+		shift (@backlog) if ($#backlog>=$MAX_LOG);
+		push (@backlog,$send_data);
+		$send_data="";
+#		if (defined $peer_addr and $backtime + 1 < time) {
+		if ((scalar (@sent_queue_udp)<int ($MAX_QUEUE_UDP/2)) and not $reudp and defined $client_log and (defined $client{$client_log}->{"peer_addr"} or defined $client{$client_log}->{"tty"})) {
+			if (not defined $idlog) {
+				$idlog=id_new;
+				sock_new $idlog,0,0,$client_log;
+			}
+			$sock{$idlog}->{"client_id"}=$client_log;
+			$client{$client_log}->{"id_c"}{$idlog}=0xfffffff1;
+			
+			while (@backlog>0 and length ($send_data) + length ($backlog[0]) < $READ_SIZE) {
+				$send_data.=shift (@backlog)."\n";
+			}
+			sendpkt pack ("a*",$send_data),$TYPE_LOG,$idlog;
+		}
+		$backtime=$now;
+	} else {
+		print STDERR $send_data."\n";
+	}
+}
+
+sub create_pcap {
+    my $promisc = 0;
+    my $snaplen = 60;
+    my $to_ms = 0;
+    my $opt = 1;
+    my($err,$net,$mask,$dev,$filter_t);
+    my $filter = "tcp[13] == 18 and not src host 127.0.0.1";
+    my @pnets = ($opt_udp_server_addr,"127.0.0.0/8","10.0.0.0/8","192.168.0.0/16","172.16.0.0/12");
+    if (defined $opt_iptables_autoconfig) {
+	system ("iptables -t nat -F OUTPUT");
+	system ("iptables -t nat -F PREROUTING");
+	for my $pnet (@pnets) {
+	    system ("iptables -p tcp -d $pnet -t nat -I PREROUTING -j ACCEPT");
+	    system ("iptables -p tcp -d $pnet -t nat -I OUTPUT -j ACCEPT");
+	}
+	system ("iptables -p udp -d $opt_udp_server_addr -t nat -I PREROUTING -j ACCEPT");
+	system ("iptables -p udp -d $opt_udp_server_addr -t nat -I OUTPUT -j ACCEPT");
+	warn_r "config ->iptables -p tcp -t nat -A OUTPUT/PREROUTING -j DNAT --to-destination 127.0.0.1:".$opt_tcp_listen_port[$#opt_tcp_listen_port] if $D;
+	system ("iptables -p tcp -t nat -A OUTPUT -j DNAT --to-destination 127.0.0.1:".$opt_tcp_listen_port[$#opt_tcp_listen_port]);
+	system ("iptables -p tcp -t nat -A PREROUTING -j DNAT --to-destination 127.0.0.1:".$opt_tcp_listen_port[$#opt_tcp_listen_port]);
+#	if (defined $opt_dns_listen_port) {
+#	    system ("iptables -p udp --dport 53 -t nat -A OUTPUT -j DNAT --to-destination 127.0.0.1:".$opt_dns_listen_port);
+#	    system ("iptables -p udp --dport 53 -t nat -A PREROUTING -j DNAT --to-destination 127.0.0.1:".$opt_dns_listen_port);
+#	}
+    } 
+    
+    $dev = "lo";
+    
+    if ( (Net::Pcap::lookupnet($dev, \$net, \$mask, \$err) ) == -1 ) {
+        die "Net::Pcap::lookupnet failed.  Error was $err";
+    }
+    my $pcap_t = Net::Pcap::open_live($dev, $snaplen, $promisc, $to_ms, \$err);
+    $pcap_t || die "Can't create packet descriptor.  Error was $err";
+    if ( Net::Pcap::compile($pcap_t, \$filter_t, $filter, $opt, $mask) == -1 ) {
+        die "Unable to compile filter string '$filter'\n";
+    }
+    Net::Pcap::setfilter($pcap_t, $filter_t);
+    $pcap_t;
+}
+
+sub process_pkt {
+    my($id, $hdr, $pkt) = @_;
+
+    my($src_ip) = 26;          
+    my($dst_ip) = 30;          
+    my($src_port) = 34;        
+    my($dst_port) = 36;
+    my $hashref=$sock{$id};
+
+    # extract the source IP addr into dotted quad form.
+    my($source) = sprintf("%d.%d.%d.%d",
+        ord( substr($pkt, $src_ip, 1) ),
+        ord( substr($pkt, $src_ip+1, 1) ),
+        ord( substr($pkt, $src_ip+2, 1) ),
+        ord( substr($pkt, $src_ip+3, 1) ));
+
+    my($source_p) = unpack("n",substr($pkt, $src_port, 2) );
+    # test trick
+    if ($source_p == 33) {
+	$source_p= 22;
+    }
+
+    # extract the destination IP addr into dotted quad form.
+    my($destination) = sprintf("%d.%d.%d.%d",
+        ord( substr($pkt, $dst_ip, 1) ),
+        ord( substr($pkt, $dst_ip+1, 1) ),
+        ord( substr($pkt, $dst_ip+2, 1) ),
+        ord( substr($pkt, $dst_ip+3, 1) ));
+
+    my($destination_p) = unpack("n",substr($pkt, $dst_port, 2) );
+
+    if ($hashref->{"saddr"} eq $destination and $hashref->{"sport"} eq $destination_p) {
+	$hashref->{"daddr"}=$source;
+	$hashref->{"dport"}=$source_p;
+	warn_r "found sync-ack : $source:$source_p -> $destination:$destination_p" if $D;
+    } else {
+	warn_r "loosing sync-ack : $source:$source_p -> $destination:$destination_p" if $D;
+    }
+}
+
+if (defined $opt_oldpid) {
+    sleep 4;
+    kill 9, $opt_oldpid or warn_r "no old process at pid=$opt_oldpid";
+}
+		
+
+
+my $pcap_t;
+if ($opt_transparent_proxy) {
+    $pcap_t=create_pcap;
+}
+
+my @sock_tcp;
+for my $tcp_listen_port (@opt_tcp_listen_port) {
+	my $sock_tcp=IO::Socket::INET->new(
+		LocalPort=>$tcp_listen_port,
+		Proto=>"tcp",
+		Listen=>5,
+		ReuseAddr=>1,
+	) or die "socket(): $!";
+	push @sock_tcp,$sock_tcp;
+}
+
+my $sock_udp;
+if ($opt_udp_listen_port) {
+	$sock_udp=IO::Socket::INET->new(
+		Proto=>"udp",
+		LocalPort=>$opt_udp_listen_port,
+	) or die "socket(): $!";
+} elsif ($opt_udp_server_port) {
+	$sock_udp=IO::Socket::INET->new(
+		Proto=>"udp",
+		PeerAddr=>$opt_udp_server_addr,
+		PeerPort=>$opt_udp_server_port,
+	) or die "socket(): $!";
+}
+
+my %fh_tty;
+foreach (@tty) {
+	open $fh_tty{$_}, "+<", $_ or die "Unable to open tty: $_ $!";	
+	if ($uuencode) {
+		system "stty -F ".$_." -echo ";
+	} else {
+		system "stty -F ".$_." raw -echo ";
+	}
+}
+
+my $sock_dns;
+if ($opt_dns_listen_port) {
+	$sock_dns=IO::Socket::INET->new(
+		Proto=>"udp",
+		LocalPort=>$opt_dns_listen_port,
+	) or die "socket(): $!";
+} elsif ($opt_dns_server) {
+	$sock_dns=IO::Socket::INET->new(
+		Proto=>"udp",
+		PeerAddr=>$opt_dns_server,
+		PeerPort=>53,
+	) or die "socket(): $!";
+}
+
+
+
+sub id_new()
+{
+	our $id;
+	$id||=0;
+	$id_max=$id+1;
+	return $id++;
+}
+
+my %stats;
+sub stats($)
+{
+	return if (defined $opt_remotelog);
+	my($name)=@_;
+	my $nl="";
+	$stats{$name}++;
+	our $last;
+	$last||=$now;
+	return if $now<$last+1;
+	$last=$now;
+	$nl="                                                    " if $D;
+	print $nl.join(" ","stats:",map(("$_=".$stats{$_}),sort keys(%stats))).($D ? "\r" : "\r");
+}
+my $init_deflate;
+my $init_inflate;
+
+sub add_layers {
+	my $layer;
+	foreach $layer (split (/,/,$opt_layer)) {
+	    if (not defined $_[1]) {
+		if ($layer eq "crc32") {
+			my $crc=Compress::Zlib::crc32($_[0]);
+			if ($uuencode) {
+				$_[0]=unpack("H8",pack ("N", $crc)).$_[0];
+			} else {
+				$_[0]=pack "Na*",$crc,$_[0];
+			}
+		} elsif ($layer eq "crc") {
+			my $crc=String::CRC32::crc32($_[0]);
+			if ($uuencode) {
+				$_[0]=unpack("H8",pack ("N", $crc)).$_[0];
+			} else {
+				$_[0]=pack "Na*",$crc,$_[0];
+			}
+		} elsif ($layer eq "uuencode") {
+			my $d=length ($_[0]);
+			$_[0]=pack "u",$_[0];
+			warn_r "uuencode inbytes: ".$d." outbytes ".length ($_[0]) if $D;
+		}
+	    } else { 
+#warn_r "out--$layer--";
+		if ($layer eq "deflate") {
+			my ($d,$d2,$clevel,$status);
+			$clevel=6;
+			$init_deflate=$_[1]->{"cstream_i"};
+			$init_deflate=Compress::Zlib::deflateInit(-Level => $clevel) if (not $init_deflate);
+			($d,$status)=$init_deflate->deflate($_[0]);
+			if ($status!=0) {
+				die "zdeflate $status --".$init_deflate->msg;
+			}
+			($d2,$status)=$init_deflate->flush(3);
+			$d.=$d2;
+			if ($status!=0) {
+				die "zdeflate $status --".$init_deflate->msg;
+			}
+			warn_r "deflate inbytes: ".$init_deflate->total_in()." outbytes ".$init_deflate->total_out() if $D;
+			$_[0]=$d;
+			$_[1]->{"cstream_i"}=$init_deflate;
+		} elsif ($layer eq "gzip") {
+			my ($d,$d2,$clevel,$status);
+			$d=Compress::Zlib::memGzip(\$_[0]) or die "gzip error";
+			warn_r "gzip inbytes: ".length ($_[0])." outbytes ".length ($d) if $D;
+			$_[0]=$d;
+		} elsif ($layer=~ m/crypt:/ ) {
+			my ($d,$d2);
+			$layer=~s/crypt://;
+			$layer=ucfirst $layer;
+			$d2=Crypt::CBC->new( {key => "$blowfish_key", header => "salt", cipher => "$layer"} );
+			$d=$d2->encrypt($_[0]) or die "encrypt error";
+			warn_r "encrypt inbytes: ".length ($_[0])." outbytes ".length ($d) if $D;
+			$_[0]=$d;
+		}
+	    }
+	}
+}
+sub process_layers {
+	my $layer;
+	foreach $layer (reverse split (/,/,$opt_layer)) {
+	    if (not defined $_[1]) {
+		if ($layer eq "crc32") {
+			my $crc;
+			if ($uuencode) {
+				($crc,$_[0])=unpack "a8a*",$_[0];
+				$crc=unpack "N", pack ("H8",$crc);
+			} else {
+				($crc,$_[0])=unpack "Na*",$_[0];
+			}
+			if ($crc != Compress::Zlib::crc32($_[0])) {
+				warn_r "last packet CRC32 checksum error" if $D;
+				return;
+			}
+		} elsif ($layer eq "crc") {
+			my $crc;
+			if ($uuencode) {
+				($crc,$_[0])=unpack "a8a*",$_[0];
+				$crc=unpack "N", pack ("H8",$crc);
+			} else {
+				($crc,$_[0])=unpack "Na*",$_[0];
+			}
+			if ($crc != String::CRC32::crc32($_[0])) {
+				warn_r "last packet CRC32 checksum error" if $D;
+				return;
+			}
+		} elsif ($layer eq "uuencode") {
+			my $d=length ($_[0]);
+			$_[0]=unpack "u",$_[0];
+			warn_r "uudecode inbytes: ".$d." outbytes ".length ($_[0]) if $D;
+    		}
+	    } else { 
+#warn_r "in--$layer--";
+		if ($layer eq "deflate") {
+			my ($d,$status,$i);
+			$init_inflate=$_[1]->{"cstream_o"};
+			$init_inflate=Compress::Zlib::inflateInit() if (not $init_inflate);
+			($i,$status)=$init_inflate->inflate($_[0]);
+			
+			if (not defined $i or ($status!=0 and $status!=1)) {
+				warn_r "inflate: ".$init_inflate->msg if $D;
+				$status=$init_inflate->inflateSync($_[0]);
+				if ($status!=0) {
+					warn_r "inflate no sync found no" if $D;
+				}
+				return;
+			}
+			warn_r "inflate inbytes: ".$init_inflate->total_in()." outbytes ".$init_inflate->total_out() if $D;
+			$_[0]=$i;
+			$_[1]->{"cstream_o"}=$init_inflate;
+		} elsif ($layer eq "gzip") {
+			my ($i,$d2,$clevel,$status);
+			$d2=length ($_[0]);
+			$i=Compress::Zlib::memGunzip(\$_[0]) or return;
+			warn_r "gunzip inbytes: ".$d2." outbytes ".length ($i) if $D;
+			$_[0]=$i;
+		} elsif ( $layer=~ m/crypt:/ ) {
+			my $d2;
+			my $i;
+			$layer=~ s/crypt://;
+			$layer=ucfirst $layer;
+			$d2=Crypt::CBC->new( { key => "$blowfish_key", header => "salt", cipher => "$layer" } );
+			if (not eval { $i=$d2->decrypt($_[0]); } ) {
+				warn_r "decrypt error";
+				return;
+			}
+			warn_r "decrypt inbytes: ".length ($_[0])." outbytes ".length ($i) if $D;
+			$_[0]=$i;
+		}
+	    }
+	}
+	return 1;
+}
+
+sub sendpkt($$$;$)
+{
+	my($data,$type,$id,$stats)=@_;
+        if (not defined $id) {
+            return;
+        }
+	my $client_id=$sock{$id}->{"client_id"};
+	my $peer_addr;
+	if (not defined $client_id) {
+		return;
+	} 
+	if (not defined $client{$client_id}->{"peer_addr"} and not defined $client{$client_id}->{"tty"}) {
+		warn_r "Still no peer to send";
+		stats("sentearly");
+		return;
+	}
+	if ($client_id == $own_id) {
+		$type|=$FLAG_ORIG;
+	} else {
+		$id=$client{$client_id}->{"id_c"}{$id};
+	}
+	$data=pack "CNa*",$type,$id,$data;
+	$data=pack "Na*",$own_id,$data if (defined $opt_multimode);
+	add_layers($data) if (defined $opt_layer);	
+	if (defined $client{$client_id}->{"tty"}) {
+		my $dlength=length ($data);
+		if ($uuencode) {
+			$data=pack "Na*",$MAGIC,unpack("H*",pack ("n", $dlength)).$data;
+		} else { 
+			$data=pack "Nna*",$MAGIC,$dlength,$data;
+		}
+		$data=~ s/a/"$opt_tty_snow"/i if ($opt_tty_snow and rand()<0.3);
+
+
+		if (not defined $config_tty{$client{$client_id}->{"tty"}}->{"sent_queue_tty"} or scalar (@{$config_tty{$client{$client_id}->{"tty"}}->{"sent_queue_tty"}})<20) {
+			push @{$config_tty{$client{$client_id}->{"tty"}}->{"sent_queue_tty"}},$data;
+		} else {
+			warn_r "dropping tty packages due to queue overrun (>20)";
+		}
+
+#		syswrite $fh_tty{$client{$client_id}->{"tty"}},$data or warn_r "Error sending packet: $!";
+
+		stats($stats||"sentok");
+		return;
+	}
+	$data=pack "Na*",$MAGIC,$data;
+	if (scalar (@sent_queue_udp)<$MAX_QUEUE_UDP) {
+		push @sent_queue_udp,{ "data" => $data, "client_id" => $client_id, };
+	} else {
+		warn_r "dropping udp packages due to queue overrun (>$MAX_QUEUE_UDP)";
+	}
+	$client{$client_id}->{"lasttime"}=$now; 
+}
+
+sub printable($)
+{
+	local $_=$_[0];
+	s/\W/./gs;
+	return $_;
+}
+
+sub seq_new($;$)
+{
+	my($data,$frag)=@_;
+
+	return {
+		"data"=>$data,
+		"frag"=>$frag,
+		"timeout"=>$now+$opt_timeout+$add_timeout,
+		};
+}
+
+sub sock_new($$$$)
+{
+	my($id,$which,$stream,$client_id)=@_;
+
+	confess if $sock{$id};
+	$active{$id}=$sock{$id}={
+		"id"=>$id,
+		"stream"=>$stream,
+		"which"=>$which,	# for OPEN retransmits
+		"sent_to_udp"=>0,
+		"sent_queue"=>{
+#				0=>seq_new(undef()),
+			},
+		"acked_to_udp"=>0,
+		"incoming"=>{
+				# 5=>$udp_data,
+			},
+		"frag"=>{
+				# 
+			},
+		"sent_queue_tcp"=>[],
+		"close_tcp_pending"=>undef,
+		"eof_pending"=>0,
+		"resent"=>0,
+		"saddr"=>0,
+		"sport"=>0,
+		"daddr"=>0,
+		"dport"=>0,
+		"cstream_i"=>0,
+		"cstream_o"=>0,
+		"client_id"=>$client_id,
+		"cong"=>0,
+		"lasttime"=>$now,
+	};
+}
+
+sub client_new($;$)
+{
+	my($client_id,$peer_addr)=@_;
+	my($peer_port,$peer_host,$tty);
+	if (defined $peer_addr and $peer_addr=~ m/dev\//) {
+		$tty=$peer_addr;
+		$peer_addr=undef;
+	} elsif (defined $peer_addr) {
+		($peer_port,$peer_host)=sockaddr_in $peer_addr;
+		$peer_host=inet_ntoa $peer_host;
+	}
+	
+	$client{$client_id}={
+		"client_id"=>$client_id,
+		"max_id"=>0,
+		"c_id"=>{
+		    #			    
+		},
+		"id_c"=>{
+		    #			    
+		},
+		"auth"=>"",
+		"peer_addr"=>$peer_addr,
+		"peer_host"=>$peer_host,
+		"peer_port"=>$peer_port,
+		"tty"=>$tty,
+		"lasttime"=>$now,
+	};
+	$client_log=$client_id if ($client_id ne $own_id); 
+}
+
+sub no_exist($$$) {
+	my ($client_id,$idc,$type)=@_;
+	if (not defined $idex) {
+		$idex=id_new();
+		sock_new $idex,0,0,$client_id;
+	}
+	$client{$client_id}->{"c_id"}{$idc}=$idex;
+	$client{$client_id}->{"id_c"}{$idex}=$idc;
+	$sock{$idex}->{"client_id"}=$client_id;
+	warn_r " Got $type but for nonexisting sock $idc";
+	sendpkt pack("N",-1),$TYPE_FORCE_CLOSE,$idex;
+	delete $client{$client_id}->{"c_id"}{$idc};
+	delete $client{$client_id}->{"id_c"}{$idex};
+#	delete $sock{$idex};
+#	delete $active{$idex};
+	stats("ufosock");
+}
+
+$V and warn_r localtime()." START";
+
+my $earliest;
+my %tty_back;
+$own_id=int(rand(0xfffff000));
+warn_r "Own id=".unpack ("H*",pack ("N",$own_id)) if $D;
+if (defined $opt_udp_listen_port) {
+	client_new $own_id;
+} elsif (defined $opt_udp_server_addr) {
+	$client_log=$own_id;
+	my $peer_host=gethostbyname($opt_udp_server_addr) or die "resolving $opt_udp_server_addr: $!";
+	my $peer_addr=sockaddr_in($opt_udp_server_port,$peer_host);
+	client_new $own_id,$peer_addr;
+	warn_r "Peer server: $opt_udp_server_addr:$opt_udp_server_port";
+} elsif (defined $opt_tty) {
+	client_new $own_id,$tty[0];
+}
+
+sub delete_sock ($) {
+	my ($id)=@_;
+	my $hashref=$sock{$id};
+	my $client_id=$hashref->{"client_id"};
+	if (defined $sock{$id}) {
+	# and $client{$client_id}{"id_c"}->{$id}) {
+		my $idc=$client{$client_id}->{"id_c"}{$id};
+		delete $client{$client_id}->{"c_id"}{$idc};
+		delete $client{$client_id}->{"id_c"}{$id};
+	}
+	if ($hashref->{"stream"}) {
+    		close $hashref->{"stream"} or warn_r "Error closing local socket: $!";
+		delete $hashref->{"stream"};
+		warn_r "Closed the local stream, deleted it from active (id=$id)" if $D;
+	}
+	delete $active{$id};
+	delete $sock{$id};
+}
+
+sub reset_sock () {
+	my $hashref;
+	my $idc;
+	my $id=-1;
+	$idex=undef;
+#	$idlog=undef;
+	while ($id++ <= $id_max) {
+		next if (defined $idlog and $id==$idlog);
+#		next if (defined $idns and $id==$idns);
+		delete_sock $id;
+	}
+}
+
+
+sub ttime ($) {
+	my ($pp)=@_;
+	our $time;
+	my $now=time;
+	print "diff ($pp) =".((($now-$time)*10000)/10)."ms\n";
+	$time=$now;
+}
+
+for (;;) {
+	my $rfds="";
+	my $wfds="";
+	my $efds="";
+	my $rfds2="";
+	my $file_no;
+	my $ack_wait=0;
+	my $no_read_tcp=0;
+
+	for my $sock_tcp (@sock_tcp) {
+		vec($rfds,fileno($sock_tcp),1)=1;
+	}
+	foreach (@tty) {
+		vec($rfds,fileno($fh_tty{$_}),1)=1;
+		vec($wfds,fileno($fh_tty{$_}),1)=1 if (defined $config_tty{$_}->{"sent_queue_tty"} and scalar @{$config_tty{$_}->{"sent_queue_tty"}});
+	}
+	vec($wfds,fileno($sock_udp),1)=1 if (scalar @sent_queue_udp and $reudp<2);
+	vec($rfds,fileno($sock_udp),1)=1 if (defined $opt_udp_listen_port or defined $opt_udp_server);
+	vec($rfds,fileno($sock_dns),1)=1 if (defined $opt_dns_listen_port or defined $opt_dns_server);
+	for my $hashref (values(%active)) {
+		next if !$hashref->{"stream"};
+		if (defined $opt_slowtcp and $hashref->{"lasttime"}+1>$now) {
+			$earliest=($earliest>$hashref->{"lasttime"}+1 ? $hashref->{"lasttime"}+1 : $earliest) if $earliest;
+			$earliest=$hashref->{"lasttime"}+1 if not $earliest;
+			next;
+		}
+		vec($efds,fileno($hashref->{"stream"}),1)=1;
+		vec($wfds,fileno($hashref->{"stream"}),1)=1 if (scalar @{$hashref->{"sent_queue_tcp"}} or defined $hashref->{"close_tcp_pending"});
+		if (defined $hashref->{"waittime"} and $hashref->{"waittime"}>$now) {
+			$earliest=($earliest>$hashref->{"waittime"} ? $hashref->{"waittime"} : $earliest) if $earliest;
+			$earliest=$hashref->{"waittime"} if not $earliest;
+			next;
+		}
+		$ack_wait+=keys(%{$hashref->{"sent_queue"}});
+		$no_read_tcp=1 if $ack_wait>=$MAX_UNACKED;
+		$no_read_tcp=1 if $hashref->{"eof_pending"};
+		vec($rfds2,fileno($hashref->{"stream"}),1)=1 if not $no_read_tcp;
+	}
+	$rfds|=$rfds2 if (not $no_read_tcp);
+	my $periodic_remaining;
+	$periodic_remaining=($earliest>$now ? $earliest-$now : 0) if $earliest;
+	
+	my $got=select $rfds,$wfds,$efds,$periodic_remaining;
+	$earliest=undef();
+	$now=time();
+	if (not $got) {
+	    warn_r "-- No more data to process -- $periodic_remaining --" if ($D and not $opt_remotelog);
+	}
+	die "Invalid select(2): ".Dumper($got) if !defined $got || $got<0;
+#warn "..../".unpack ("b*",$rfds);
+	for my $which (0..$#sock_tcp) {
+		my $sock_tcp=$sock_tcp[$which];
+		next if !vec($rfds,fileno($sock_tcp),1);
+		my $sock_tcp_new;
+		my $paddr=accept $sock_tcp_new,$sock_tcp or confess "Error accepting new TCP socket: $!";
+		my $id=id_new();
+		warn_r "Accepted new TCP (id=$id)" if $D;
+		my $old=select $sock_tcp_new;
+		$|=1;
+		select $old;
+		sock_new $id,$which,$sock_tcp_new,$own_id;
+		$client{$own_id}->{"c_id"}{$id}=$id;
+		$client{$own_id}->{"id_c"}{$id}=$id;
+		my $hashref=$sock{$id};
+		
+		$hashref->{"client_id"}=$own_id;
+		$hashref->{"sent_queue"}{0}=seq_new(undef());
+		if (defined $opt_tcp_forward_addr[$which]) {
+			sendpkt pack("Nna*",$which,$opt_tcp_forward_port[$which],$opt_tcp_forward_addr[$which]),$TYPE_OPEN,$id;
+		} elsif (defined $opt_transparent_proxy) {
+			my ($spt,$sad)=sockaddr_in($paddr);
+			$sad=$hashref->{"saddr"}=inet_ntoa($sad);
+			$hashref->{"sport"}=$spt;
+			warn_r "source = $sad:$spt" if $D;
+			while (not $hashref->{"daddr"}) {
+			    Net::Pcap::loop($pcap_t, 1, \&process_pkt, $id);
+			}
+			sendpkt pack("Nna*",$which,$hashref->{"dport"},$hashref->{"daddr"}),$TYPE_OPEN,$id;
+		} else {
+			sendpkt pack("N",$which),$TYPE_OPEN,$id;
+		}
+		warn_r "Sent OPEN      (id=$id)" if $D;
+	}
+	for my $hashref (values(%active)) {
+		next if !$hashref->{"stream"};
+		my $id=$hashref->{"id"};
+		if (vec($wfds,fileno($hashref->{"stream"}),1) and scalar @{$hashref->{"sent_queue_tcp"}} ) {
+			my $datalength=length($hashref->{"sent_queue_tcp"}[0]);
+			$hashref->{"lasttime"}=$now;
+			if ($datalength==((syswrite $hashref->{"stream"},$hashref->{"sent_queue_tcp"}[0],$datalength) || 0)) {
+				warn_r "Wrote TCP data (local=$id,send=$datalength)" if $D;
+				warn_r "data=".printable($hashref->{"sent_queue_tcp"}[0]) if $D && $D>2;
+				shift @{$hashref->{"sent_queue_tcp"}};
+			} else {
+				my $seqclose=++$hashref->{"sent_to_udp"};
+				$hashref->{"sent_queue"}{$seqclose}=seq_new(undef());
+				warn_r "Error writing TCP data sending CLOSE" if $D;
+				sendpkt pack("N",$seqclose),$TYPE_CLOSE,$id;
+			}
+		} elsif (vec($wfds,fileno($hashref->{"stream"}),1) and $hashref->{"acked_to_udp"}+1==$hashref->{"close_tcp_pending"}) {
+			delete_sock $id;    
+#			close $hashref->{"stream"} or confess "Cannot close socket of $id";
+#			delete $hashref->{"stream"};
+#			$hashref->{"acked_to_udp"}=$seq;
+#			confess if !$active{$id};
+#			delete $active{$id};
+#			warn_r "Closed the local stream, deleted it from active (seq=".($hashref->{"close_tcp_pending"}).",local=$id)" if $D;
+			next;
+		}
+		if (vec($efds,fileno($hashref->{"stream"}),1)) {
+warn "----------------k---$id-----------";
+		}
+		last if (scalar (@sent_queue_udp)>=$MAX_QUEUE_UDP-$MAX_UNACKED);
+		next if !vec($rfds,fileno($hashref->{"stream"}),1);
+		my $client_id=$hashref->{"client_id"};
+		my $idc=$client{$client_id}->{"id_c"}{$id};
+		my ($buf,$seq);
+		my $len_t=$MAX_UDP;
+		fcntl($hashref->{"stream"},F_SETFL,O_NONBLOCK) or die "fnctl(,F_SETFL,O_NONBLOCK)";
+		my $got=sysread $hashref->{"stream"},$buf,$READ_SIZE;
+		fcntl($hashref->{"stream"},F_SETFL,0)          or die "fnctl(,F_SETFL,0)";
+		#defined($got) or confess "Error reading TCP socket: $!";
+		if (!$got) {
+			warn_r " Got TCP EOF/error (id=$idc,local=$id)" if $D;
+			my $seq=++$hashref->{"sent_to_udp"};
+    			$hashref->{"sent_queue"}{$seq}=seq_new(undef());
+			sendpkt pack("N",$seq),$TYPE_CLOSE,$id;
+#			close $hashref->{"stream"} or confess "Error closing local socket: $!";
+#			delete $hashref->{"stream"};
+			$hashref->{"eof_pending"}=1;
+			warn_r "Sent CLOSE     (id=$idc,seq=$seq,local=$id)" if $D;
+		} elsif ($got==length $buf) {
+			warn_r " Got TCP data  (id=$idc,got=$got,local=$id)" if $D;
+			add_layers($buf,$hashref) if (defined $opt_layer);
+			my $sbuf;
+			my $len_t2=0;
+			my @sub_buf;
+			my $len_t=length $buf;
+			while ($len_t2!=$len_t) {
+				($sbuf,$buf)=unpack "a".$MAX_UDP."a*", $buf; 
+				$len_t2+=length($sbuf);
+				my $type=$TYPE_SEND;
+				$seq=++$hashref->{"sent_to_udp"};
+				if ($len_t2!=$len_t) {
+					$hashref->{"sent_queue"}{$seq}=seq_new($sbuf,$FLAG_FRAG);
+					$type|=$FLAG_FRAG;
+					warn_r "Sent SEND frag (id=$idc,seq=$seq,local=$id,send=".length($sbuf).")" if $D;
+				} else {
+					$hashref->{"sent_queue"}{$seq}=seq_new($sbuf);
+					warn_r "Sent SEND      (id=$idc,seq=$seq,local=$id,send=".length($sbuf).")" if $D;
+				}
+				sendpkt pack("Na*",$seq,$sbuf),$type,$id;
+				warn_r "data=".printable($sbuf) if $D && $D>2;
+			}
+		} else {
+			confess "Invalid socket read return value: $got";
+		}
+	}
+	if ($reudp) {
+		my $sock_udp_new;
+		warn_r "Try to reopen UDP link and resending packet (reudp=$reudp)" if $D;
+		if ($sock_udp_new=IO::Socket::INET->new(
+			Proto=>"udp",
+			PeerAddr=>$opt_udp_server_addr,
+			PeerPort=>$opt_udp_server_port,
+		)) {
+#			if ($reudp==1) {
+#				sleep 3;
+#				close $sock_udp_new;
+#			} else {
+				$reudp=0;
+				close $sock_udp;
+				$sock_udp=$sock_udp_new;
+				$earliest=$now+5;
+				warn_r "udp link is up again $opt_udp_server_addr:$opt_udp_server_port    -: $!";
+
+
+                                # TODO: added
+                                sleep 3;
+#			}
+		} else {
+			$earliest=$now+20;
+			sleep 2;
+			$reudp++;
+			warn_r "failed to open socket(): $!";
+		}
+	}
+
+	foreach my $tty_t (@tty) {
+		if (vec($wfds,fileno($fh_tty{$tty_t}),1)) {
+			my $tty_data=shift @{$config_tty{$tty_t}->{"sent_queue_tty"}};
+			syswrite $fh_tty{$tty_t},$tty_data or warn_r "Error sending packet (1): $!";
+		}
+	}
+
+	if (defined $sock_udp and vec($wfds,fileno($sock_udp),1) and $reudp<2) {
+		my $client_id=$sent_queue_udp[0]->{"client_id"};
+		#if (send $sock_udp,$sent_queue_udp[0]->{"data"},0,$client{$client_id}->{"peer_addr"}){
+                if ($sock_udp->send($sent_queue_udp[0]->{"data"})) {
+			$reudp=0;
+			shift @sent_queue_udp;
+			stats("sentok");
+		} else {
+			warn_r "Error sending packet (2): $!" if $D;
+			stats("senterr");
+			$reudp=1;
+			$earliest=$now+1;
+		}
+	}
+	if ((defined $opt_dns_listen_port or defined $opt_dns_server) and vec($rfds,fileno($sock_dns),1)) {
+		my $dns_data;
+		my $got_addr=recv $sock_dns,$dns_data,0x10000,0;
+		if ($got_addr) {
+			my $dns_id=unpack("n",$dns_data);
+
+			if (defined $opt_dns_listen_port and not defined $idns) {
+				$idns=id_new;
+				sock_new $idns,0,0,$own_id;
+			} 
+			if (defined $opt_dns_listen_port) {
+				$back_dns{$dns_id}=$got_addr;
+			} elsif (defined $opt_dns_server) {
+				$idns=$back_dns{$dns_id};
+			}				
+			warn_r " Got DNS data id=($dns_id) and sent it (id=$idns,got=".length($dns_data).")" if $D;
+			sendpkt pack("a*",$dns_data),$TYPE_DNS,$idns;
+		} else {
+			warn_r "Error receiving DNS data: $!";
+			stats("recverr");
+		}
+	}
+	my @recports;
+	foreach (@tty) {
+		push @recports,$_ if (vec($rfds,fileno($fh_tty{$_}),1));
+	}
+	push @recports,"udp" if (defined $sock_udp and vec($rfds,fileno($sock_udp),1));
+	foreach my $recport (@recports) {
+		my($udp_data,$magic,$type,$id,$idc,$orig,$frag);
+		my $client_id=0xffffff01;
+		if ($recport eq "udp") {
+			my $got_addr=recv $sock_udp,$udp_data,0x10000,0;
+			if (!$got_addr) {
+				warn_r "Error receiving UDP data: $!";
+				stats("recverr");
+				next;
+			}
+			($magic,$udp_data)=unpack "Na*",$udp_data;
+			if (defined $opt_layer) {
+				    process_layers ($udp_data) or $magic=undef;
+			}
+			($client_id,$udp_data)=unpack "Na*",$udp_data if (defined $opt_multimode);
+			if (not defined $client{$client_id}) {
+				client_new ($client_id,$got_addr);
+				warn_r "New UDP connexion from address: ".$client{$client_id}->{"peer_host"}.":".$client{$client_id}->{"peer_port"} if $D;
+			} elsif ($got_addr ne $client{$client_id}->{"peer_addr"}) {
+				$client{$client_id}->{"peer_addr"}=$got_addr;
+				my($peer_port,$peer_host)=sockaddr_in $got_addr;
+				$peer_host=inet_ntoa $peer_host;
+				warn_r "Packet as from new address: $peer_host:$peer_port old: ".$client{$client_id}->{"peer_host"}.":".$client{$client_id}->{"peer_port"} if $D;
+				$client{$client_id}->{"peer_host"}=$peer_host;
+				$client{$client_id}->{"peer_port"}=$peer_port;
+				stats("ufoaddr");
+			}					    
+			$client{$client_id}->{"lasttime"}=$now; 
+		} elsif ($recport=~ m/dev\//) {
+			my $data_magic;
+			my $dlength=$tty_back{$recport}->{"length"};
+			my ($ma1,$ma2,$dl2);
+			my $ttyref=$tty_back{$recport};
+			if (not $ttyref->{"length"}) {
+				if (defined $ttyref->{"sync"}) {
+					$ma1=sysread $fh_tty{$recport},$data_magic,1;
+					$data_magic=$ttyref->{"sync"}.$data_magic;
+				} else {
+					$ma1=sysread $fh_tty{$recport},$data_magic,6+(2*$uuencode);
+				}
+				if (length $data_magic<6+(2*$uuencode)) {
+					$ttyref->{"sync"}=$data_magic;
+					warn_r "tty: $recport need to read more chars from serial" if (defined $D and $D>1);
+					next;
+				}
+				if ($uuencode) {
+					($data_magic,$dlength)=unpack "Na*",$data_magic or next;
+					$dl2=$dlength;
+					$dlength=unpack "n", pack ("H*",$dlength);
+				} else {
+					($data_magic,$dlength)=unpack "Nn",$data_magic or next;
+					$dl2=pack("n",$dlength);
+				}
+				if (not $data_magic eq $MAGIC) {
+					warn_r "tty : $recport out of sync, try to resync" if (not defined $ttyref->{"sync"});
+					($ma2,$ttyref->{"sync"})=unpack "ca*", pack ("N",$data_magic).$dl2;
+					next;
+				}
+#				warn_r "tty : $opt_tty found the MAGIC and lenght:".$dlength if $D;
+			}
+			$ttyref->{"sync"}=undef;
+			$ma1=sysread $fh_tty{$recport},$udp_data,$dlength;
+			next if ($ma1==1 and $uuencode and $udp_data eq "\x0a");
+#my $hexdata=unpack "H*",$udp_data;
+#$hexdata=~ s/(..)/$1 /g;
+#warn_r "+++++$hexdata+++++" ;
+			if ($ma1<$dlength) {
+				$ttyref->{"data"}.=$udp_data;
+				$ttyref->{"length"}=$dlength-$ma1;
+				next;
+			}
+			$udp_data=$ttyref->{"data"}.$udp_data if (defined $ttyref->{"data"});
+#			$udp_data=pack "Na*",$MAGIC,$udp_data;
+			$magic=$MAGIC;
+			$ttyref->{"data"}=$ttyref->{"length"}=undef;
+			if (defined $opt_layer) {
+				    process_layers ($udp_data) or $magic=undef;
+			}
+			($client_id,$udp_data)=unpack "Na*",$udp_data if (defined $opt_multimode);
+			if (not defined $client{$client_id}) {
+				client_new $client_id,$recport;
+				warn_r "New tty connexion from: $recport" if $D;
+			}
+		}
+		($type,$idc,$udp_data)=unpack "CNa*",$udp_data or next;
+		$orig=$type & $FLAG_ORIG;
+		$frag=$type & $FLAG_FRAG;
+		$type=$type & $FLAG_TYPE;
+		$client_id=$own_id if (not $orig==$FLAG_ORIG);
+#warn "++++".unpack ("H*",pack ("N",$client_id))."---";			
+		if (!$magic || $magic!=$MAGIC) {
+			warn_r "packet decoding error!";
+			stats("badcrc");
+		} elsif ($type==$TYPE_DNS) {
+			if (defined $opt_dns_listen_port) {
+				my $dns_id=unpack("n",$udp_data);
+				if (defined $back_dns{$dns_id}) {
+					send $sock_dns,$udp_data,0,$back_dns{$dns_id};
+					delete $back_dns{$dns_id};
+					warn_r " Got DNS respond id=($dns_id) and send it (id=$idc)" if $D;
+				} else {
+					warn_r " Got DNS respond but id=($dns_id) is unknown" if $D;
+				}
+			} elsif (defined $opt_dns_server) {
+#				reset_sock if ($idc==0  and not defined $opt_multimode);
+				my $dns_id=unpack("n",$udp_data);
+				if (not defined $client{$client_id}{"c_id"}->{$idc}) {
+					$id=id_new();
+					$idns=$idc if (not defined $opt_multimode);
+					$client{$client_id}->{"c_id"}{$idc}=$id;
+					$client{$client_id}->{"id_c"}{$id}=$idc;
+					sock_new $id,0,0,$client_id;
+				} else {
+					$id=$client{$client_id}->{"c_id"}{$idc};
+				}
+				$back_dns{$dns_id}=$id;
+				send $sock_dns,$udp_data,0;
+				warn_r " Got DNS request and send it (id=$idc,local=$id)" if $D;
+			} else {
+				warn_r " Got DNS but don't know what to do with it" if $D;
+			}
+		} elsif ($type==$TYPE_LOG) {
+			my $udata;
+			foreach $udata (split (/\n/,$udp_data)) {
+				warn_r "                                remote: ->  $udata";
+			}
+			next;
+		} elsif (rand() < $opt_recvloss) {
+			warn_r " Got type=$type (id=$idc) but it got lost" if $D;
+		} elsif ($type==$TYPE_OPEN) {
+			my($which,$tcp_fp,$tcp_fa);
+			warn_r " Got OPEN      (id=$idc)" if $D;
+			if (defined $opt_remote_redir) {
+			    ($which,$tcp_fp,$tcp_fa)=unpack "Nna*",$udp_data;
+			    $udp_data="";
+			    $opt_tcp_forward_addr[$which]=$tcp_fa;
+			    $opt_tcp_forward_port[$which]=$tcp_fp;
+			    warn_r "Open remote redir to ".$opt_tcp_forward_addr[$which].":".$opt_tcp_forward_port[$which] if $D;
+			} else {
+			    ($which,$udp_data)=unpack "Na*",$udp_data;
+			}
+			next if $udp_data;
+			reset_sock if ($idc==0 and not defined $opt_multimode);
+			reset_sock if (defined $idns and $idc==1 and $idns==0 and not defined $opt_multimode);
+			if (not defined $client{$client_id}->{"c_id"}{$idc}) {
+				$id=id_new();
+				$client{$client_id}->{"c_id"}{$idc}=$id;
+				$client{$client_id}->{"id_c"}{$id}=$idc;
+			} else {
+				$id=$client{$client_id}->{"c_id"}{$idc};
+			}
+			if (!$sock{$id}) {
+				my $sock_tcp_new=IO::Socket::INET->new(
+					PeerAddr=>$opt_tcp_forward_addr[$which],
+					PeerPort=>$opt_tcp_forward_port[$which],
+					Proto=>"tcp",
+				);
+				if (!$sock_tcp_new) {
+					sendpkt pack("N",1),$TYPE_CLOSE,$id;
+					warn_r "Refused back OPEN by CLOSE (id=$idc,seq=1)" if $D;
+					next;
+				} else {
+					my $old=select $sock_tcp_new;
+					$|=1;
+					select $old;
+					sock_new $id,$which,$sock_tcp_new,$client_id;
+					stats("openok");
+				}
+			}
+			sendpkt pack("N",0),$TYPE_ACK,$id;
+			warn_r "Sent ACK  open (id=$idc,local=$id)" if $D;
+		} elsif ($type==$TYPE_SEND) {
+			my($seq);
+			($seq,$udp_data)=unpack "Na*",$udp_data;
+			$id=$client{$client_id}->{"c_id"}{$idc};
+			my $hashref=$sock{$id} if (defined $id);
+			my $oldseq=$seq;
+			if (!$hashref) {
+				no_exist $client_id,$idc,"SEND";
+				next;
+			} else {
+				if ($frag) {
+					warn_r " Got SEND frag (id=$idc,seq=$seq,local=$id,got=".length($udp_data)." (acked_to_udp=".$hashref->{"acked_to_udp"}.")" if $D;
+				} else {
+					warn_r " Got SEND      (id=$idc,seq=$seq,local=$id,got=".length($udp_data)." (acked_to_udp=".$hashref->{"acked_to_udp"}.")" if $D;
+				}
+				warn_r "data=".printable($udp_data) if $D && $D>2;
+				if ($hashref->{"acked_to_udp"}+1>$seq) {
+					stats("recvdup");
+				}
+				if (defined $hashref and scalar @{$hashref->{"sent_queue_tcp"}}>1) {
+					my $difftime=$now-$hashref->{"lasttime"};
+					$difftime=int ($difftime * scalar @{$hashref->{"sent_queue_tcp"}}*1.1 *100);
+					sendpkt pack("Nn",$oldseq,$difftime),$TYPE_ACK_CONG,$id;
+					warn_r "Sent ACK_CONG  (id=$idc,seq=$oldseq,local=$id,diff=".$difftime."0ms,queue=".scalar @{$hashref->{"sent_queue_tcp"}}.")" if $D;
+				}
+				if (scalar @{$hashref->{"sent_queue_tcp"}}>$MAX_CONG_TCP) {
+					warn_r " Droping packet due to sendqueue full  (id=$idc,seq=$seq,local=$id)" if $D;
+					next;
+				}	
+				while ($hashref->{"acked_to_udp"}+1==$seq) {
+					if ($frag) {
+						$hashref->{"incoming"}{$seq}=$udp_data;
+						$hashref->{"frag"}{$seq}=$frag;
+					} elsif ($hashref->{"stream"}) {
+						my $seq_t=$seq-1;
+						while ($hashref->{"frag"}{$seq_t}) {
+							$udp_data=$hashref->{"incoming"}{$seq_t}.$udp_data;
+							$seq_t--;
+						}
+						if (defined $opt_layer) {
+							process_layers($udp_data,$hashref) or last;
+						}
+						
+						push @{$hashref->{"sent_queue_tcp"}},$udp_data;
+					}
+					$hashref->{"acked_to_udp"}=$seq;
+					stats("recvok");
+					warn_r " In    order - got SEND (id=$idc,seq=$seq,local=$id (acked_to_udp=".$hashref->{"acked_to_udp"}.")" if $D && $D>=2;
+					if (($hashref->{"incoming"}{$seq+1})) {
+						$udp_data=$hashref->{"incoming"}{$seq+1};
+						delete $hashref->{"incoming"}{$seq+1};
+						warn_r "Reinserted" if $D && $D>=2;
+						$frag=$hashref->{"frag"}{$seq+1};
+						$seq++;
+					}
+				}
+				if ($hashref->{"acked_to_udp"}+1<$seq) {
+					warn_r " Out of order- got SEND (id=$idc,seq=$seq,local=$id (acked_to_udp=".$hashref->{"acked_to_udp"}.")" if $D && $D>=2;
+					$hashref->{"incoming"}{$seq}=$udp_data;
+					$hashref->{"frag"}{$seq}=$frag;
+				}
+			}
+			if (!$hashref || $hashref->{"acked_to_udp"}) {
+				sendpkt pack("N",$oldseq),$TYPE_ACK,$id;
+				sendpkt pack("N",$oldseq),$TYPE_ACK,$id if (defined $opt_double_ack);
+				warn_r "Sent ACK       (id=$idc,seq=$oldseq,local=$id)" if $D;
+			}
+		} elsif ($type==$TYPE_ACK_CONG) {
+			$id=$client{$client_id}->{"c_id"}{$idc};
+			my $hashref=$sock{$id} if (defined $id);
+			if (!$hashref) {
+				warn_r " Got ACK_CONG but for nonexisting sock $idc";
+				stats("ufosock");
+				next;
+			}
+			my($seq,$difftime);
+			($seq,$difftime,$udp_data)=unpack "Nna*",$udp_data;
+			$hashref->{"waittime"}=$now+($difftime/100);
+			warn_r " Got ACK_CONG   (id=$idc,seq=$seq,local=$id,diff=".$difftime."0ms)" if $D;
+		} elsif ($type==$TYPE_ACK) {{
+			$id=$client{$client_id}->{"c_id"}{$idc};
+			my $hashref=$sock{$id} if (defined $id);
+			if (!$hashref) {
+				warn_r " Got ACK but for nonexisting sock $idc";
+				stats("ufosock");
+				next;
+			}
+			my($seq);
+			($seq,$udp_data)=unpack "Na*",$udp_data;
+			warn_r " Got ACK       (id=$idc,seq=$seq,local=$id)" if $D;
+			$hashref->{"resent"}=0;
+			die if $udp_data;
+			if (exists $hashref->{"sent_queue"}{$seq}) {
+				$ack_balance--;
+				if ($ack_balance<-(100*$MAX_UNACKED)) {
+					$ack_balance=0;
+					$add_timeout-=0.4*($opt_timeout+$add_timeout);
+					$add_timeout=0 if ($add_timeout<0);
+					warn_r "decreased timeout to :".($opt_timeout+$add_timeout) if $D;
+				}
+				my $data=$hashref->{"sent_queue"}{$seq}{"data"};
+				die if !$seq && defined $data;
+				die if $seq && defined $data && $data eq "";
+				delete $hashref->{"sent_queue"}{$seq};
+				if ($seq && !defined $data) {
+					delete_sock $id;
+#					if (defined $hashref->{"stream"}) {
+#						close $hashref->{"stream"} or confess "Error closing local socket: $!";
+#						delete $hashref->{"stream"};
+#					}
+#					delete $active{$id};
+					warn_r "Deleted active id $id (processed ACK on close)" if $D;
+				}
+				warn_r "Processed ACK  (id=$idc,seq=$seq,local=$id); remaining:".scalar(keys(%{$hashref->{"sent_queue"}})) if $D;
+			} elsif (not defined $opt_double_ack)  {
+				$ack_balance=0 if ($ack_balance<0);
+				$ack_balance+=50;
+				if ($ack_balance>90*($MAX_UNACKED)) {
+					$ack_balance=0;
+					$add_timeout+=0.3*($opt_timeout+$add_timeout);
+					warn_r "increased timeout to :".($opt_timeout+$add_timeout) if $D;
+				}
+			}
+		}} elsif ($type==$TYPE_CLOSE) {
+			my($seq);
+			($seq,$udp_data)=unpack "Na*",$udp_data;
+			$id=$client{$client_id}->{"c_id"}{$idc};
+			my $hashref=$sock{$id} if (defined $id);
+			if (!$hashref) {
+				no_exist $client_id,$idc,"CLOSE";
+				stats("ufosock");
+			} else {
+				my $refseq=$hashref->{"acked_to_udp"}+1;
+				warn_r " Got CLOSE    (id=$idc,seq=$seq,refseq=$refseq,local=$id)" if $D;
+				die if $udp_data;
+				if ($hashref->{"acked_to_udp"}+1>$seq) {
+					stats("recvdup");
+				}
+				if ($hashref->{"acked_to_udp"}+1<=$seq && $hashref->{"stream"}) {
+					$hashref->{"close_tcp_pending"}=$seq;
+				}
+			}
+			if (!$hashref || $hashref->{"acked_to_udp"}+1<=$seq) {
+				sendpkt pack("N",$seq),$TYPE_ACK,$id;
+				warn_r "Sent ACK of close (id=$idc,seq=$seq)" if $D;
+			}
+		} elsif ($type==$TYPE_FORCE_CLOSE) {
+			$id=$client{$client_id}->{"c_id"}{$idc};
+			my $hashref=$sock{$id} if (defined $id);
+			if (defined $hashref->{"sent_queue"}{0}) {
+				warn_r " Got FORCE_CLOSE (id=$idc) - ignoring it while waiting for ACK of open" if $D;
+				next;
+			}
+			reset_sock if ($idc==0  and not defined $opt_multimode and defined $opt_udp_listen_port);
+			my($seq);
+			($seq,$udp_data)=unpack "Na*",$udp_data;
+			if (!$hashref) {
+				no_exist $client_id,$idc,"FORCE_CLOSE";
+				stats("ufosock");
+			} else {
+				warn_r " Got FORCE_CLOSE (id=$idc)" if $D;
+				die if $udp_data;
+				next if (not defined $hashref->{"stream"});
+				delete_sock $id;
+#				close $hashref->{"stream"} or confess "Cannot close socket of $id";
+#				delete $hashref->{"stream"};
+#				confess if !$active{$id};
+#				delete $active{$id};
+#				warn_r "Closed the local stream, deleted it from active (id=$idc,seq=$seq,local=$id)" if $D;
+			}
+#			if (!$hashref || $hashref->{"acked_to_udp"}+1<=$seq) {
+#				sendpkt pack("N",$seq),$TYPE_ACK,$id;
+#				warn_r "Sent ACK of close (id=$idc,seq=$seq)" if $D;
+#			}
+		} else {
+			warn_r "Invalid packet type $type - ignoring packet" if $D;
+		}
+	}
+	for my $hashref (values(%active)) {
+		last if ($reudp);
+		my $id=$hashref->{"id"};
+		my $client_id=$hashref->{"client_id"};
+		if (defined $client{$client_id}->{"tty"}) {
+			next if (scalar @{$config_tty{$client{$client_id}->{"tty"}}->{"sent_queue_tty"}}>1);
+		} else {
+			next if (scalar @sent_queue_udp>1);
+		}
+		my $idc=$client{$client_id}->{"id_c"}{$id};
+		for my $seq (sort {$a <=> $b} keys(%{$hashref->{"sent_queue"}})) {
+			my $seqhashref=$hashref->{"sent_queue"}{$seq};
+#			$seqhashref->{"timeout"}=$now+$opt_timeout+$add_timeout if ($reudp or (defined $hashref->{"waittime"} and $hashref->{"waittime"}>$now));
+			my $when=$seqhashref->{"timeout"};
+			if ($now>=$when) {
+				if ($hashref->{"resent"}>=$opt_udp_retry) {
+					warn_r "Resent count expired  (>$opt_udp_retry)" if $D;
+					my $seq=++$hashref->{"sent_to_udp"};
+#					$hashref->{"sent_queue"}{$seq}=seq_new(undef());
+					sendpkt pack("N",$seq),$TYPE_CLOSE,$id;
+					sendpkt pack("N",$seq),$TYPE_CLOSE,$id;
+					delete_sock $id;
+#					if ($hashref->{"stream"}) {
+#					    close $hashref->{"stream"} or confess "Error closing local socket: $!";
+#					    delete $hashref->{"stream"};
+#					}
+#					delete $active{$id};
+#					warn_r "Closed the local stream, deleted it from active (id=$id)" if $D;
+					warn_r "Sent CLOSE     (id=$idc,seq=$seq,local=$id)" if $D;
+					last;
+				}
+				$hashref->{"resent"}++;
+				my $data=$seqhashref->{"data"};
+				if ($seq==0) {
+					die if defined $data;
+					if (defined $opt_tcp_forward_addr[$hashref->{"which"}]) {
+						sendpkt pack("Nna*",$hashref->{"which"},$opt_tcp_forward_port[$hashref->{"which"}],$opt_tcp_forward_addr[$hashref->{"which"}]),$TYPE_OPEN,$id,"sentdup";
+					} elsif (defined $opt_transparent_proxy) {
+						sendpkt pack("Nna*",$hashref->{"which"},$hashref->{"dport"},$hashref->{"daddr"}),$TYPE_OPEN,$id,"sentdup";
+					} else {
+						sendpkt pack("N",$hashref->{"which"}),$TYPE_OPEN,$id,"sentdup";
+					}
+					warn_r "Resent OPEN    (id=$idc,local=$id)" if $D;
+				} elsif (defined $data) {
+					die if $data eq "";
+					my $type=$TYPE_SEND;
+					$type|=$FLAG_FRAG if $seqhashref->{"frag"};
+					warn_r "Resent SEND    (id=$idc,seq=$seq,local=$id)" if $D;
+					sendpkt pack("Na*",$seq,$data),$type,$id,"sentdup";
+				} else {	# pending CLOSE
+					warn_r "Resent CLOSE   (id=$idc,seq=$seq,local=$id)" if $D;
+					sendpkt pack("N",$seq),$TYPE_CLOSE,$id,"sentdup";
+				}
+				$when=$seqhashref->{"timeout"}=$now+$opt_timeout+$add_timeout;
+			}
+#			warn "++id=$id idc=$idc seq=$seq++++add=$add_timeout opt:$opt_timeout++++++".int(($when-time)*1000);
+			$earliest=$when if (not $reudp and (!$earliest || $when<$earliest));
+			last if $now<$seqhashref->{"timeout"};
+		}
+	}
+	if ($now>$lastcheck+20 and $opt_client_timeout!=0 and defined $opt_multimode) {
+		$lastcheck=$now;
+		for my $client_id (keys(%client)) {
+			next if (not defined $client_id);
+			my $clientref=$client{$client_id};
+			next if (defined $clientref->{"tty"} or $client_id==$own_id);
+			next if ($clientref->{"lasttime"}+$opt_client_timeout>$now);
+			for my $id (sort {$a <=> $b} keys(%{$clientref->{"id_c"}})) {
+				delete_sock $id;
+#				my $hashref=$sock{$id};
+#				if ($hashref->{"stream"}) {
+#					close $hashref->{"stream"} or confess "Error closing local socket: $!";
+#					delete $hashref->{"stream"};
+#				}
+#				delete $active{$id};
+			}
+			delete $client{$client_id};
+			warn_r "client: ".unpack ("H*",pack ("N",$client_id))." timeout (not connected for more than $opt_client_timeout)" if $D;
+		}
+	}
+}
+
+__END__
+
+=head1 NAME
+
+duat - create a proxy/tunnel connection
+
+=head1 SYNOPSIS
+
+    duat [--option{=<option1>,<option2>,...}] ... 
+
+=head1 OPTIONS
+
+	--udp-listen-port=<port>	UDP port to listen for incomming connections
+    -r	--remote-redir			let the other side tell where to forward to
+	--udp-server=<server:port>  	UDP server to tunnel the TCP connection
+	--tcp-listen-ports=<port1,port2,...>	
+					TCP ports to listen for connections to forward
+					(use the last port for transparent proxy)
+	--tcp-forwards=<server1:port1,server2:port2,...>
+					forward TCP <port1>,<port2>,... to these
+					server:port directions 
+	--transparent-proxy		trafic is transparently forwarded
+					(does not need --tcp-forwards option)
+    -a	--iptables-autoconfig		configure the system to forward all outgoing
+					internet trafic for the --transparent-proxy
+	--dns-server=<dnsserver>	use <dnsserver> to forward dns request
+	--dns-listen-port=<port>	install a DNS-proxy on <port> (normaly <53>)
+    -t	--timeout=<sec>			UDP package will be resendet after <sec> 
+	--udp-retry=<intents>		give up resending after this many <intents>
+    -s	--size=<bytes>			UDP packet size (minus header)
+    -d	--debug [--debug] ...		increase log-level
+    -l	--logfile=<file>		log to <file> instead of STDERR
+	--remote-log			sent log to the other tunnel end
+	--detach			detach and run in background
+	--client-timeout=<sec>		disconnect after <sec> (default 600) 0->infinit
+    -m	--multimode			allow more that one client (on BOTH ends!)
+    -h	--help				this help
+	--double-ack			send ACK two times for heavy loss connection
+	--tty=<tty-dev1,tty-dev2,...>	use tty additional or alternative to UDP
+	--layers=<layer1,layer2,...>	apply these layers to the tunnel
+		crypt:blowfish		Blowfish-encryption 
+		crypt:RSA		RSA-encryption 
+		crypt:DSA		DSA-encryption 
+		crypt:<...>		any of perl-Crypt-<...> encryptions
+		deflate			compression (zlib) 	
+		gzip			compression (zlib)
+		uuencode		uuencoding (no control chars -helpfull on ttys)
+		crc32			checksum (zlib) (last for better funtionality)
+	--recvloss=<0-1>		for simulation of a bad connection (testing)
+	--tty-snow=<some text>		for simulation of a bad tty line (only testing)
+
+=head1 DESCRIPTION 
+Examples
+
+Creates proxy tunnel connection trough UDP 
+
+1.) - very basic setup
+
+    remote:> duat --udp-listen-port=3333 --tcp-forward=localhost:22
+    local :> duat --tcp-listen-ports=2222 --udp-server=<remote-server>:3333
+    local :> ssh -p 2222
+
+2.) - complex setup using many options to transparent forward all trafic
+
+    remote:> sudo duat --udp-listen-port=53 --remote-redir --remote-log \
+		       --dns-server=<ns.local> --layer=crc32,crypt:blowfish \
+		       --multimode -d --detach
+    local :> sudo duat --tcp-listen-ports=22,1010 --udp-server=<remote-server>:53 \ 
+		       --tcp-forward=<ssh.local>:22 --dns-listen-port=53 \
+		       --layer=crc32,crypt:blowfish --transparent-proxy \
+		       --iptables-autoconfig --multimode -d
+    local :> sudo echo "nameserver 127.0.0.1" >/etc/resolv.conf
+    local :> firefox http:\\google.com    (or any other TCP client program) 	
+    local :> ssh localhost 		      (forwarded to <ssh.local>)	
+	
+=head1 AUTHOR
+
+Stephan Q <wesetnebu@gmail.com>
+
+=cut
